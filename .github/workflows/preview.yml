@@ -1,23 +1,24 @@
 name: Preview Deploy (PR)
 
-# Per-PR preview for LDCo client sites. Builds the PR and deploys it to a
-# DETERMINISTIC Netlify alias, then posts the real URL into the same Zulip
-# #qa topic the QA bot opened. The QA bot no longer guesses a preview URL —
-# this workflow is the single source of truth, so there is no repo->site map
-# to drift out of date (that gap is what broke GRL PR #1).
+# Org-wide PR preview for LDCo client sites. Lives ONLY in Lockard/ldco-ci and
+# is injected into every repo's PRs by the org ruleset "Require PR preview".
+# There is no per-repo copy and no repo->site map to drift (that gap broke GRL).
 #
-# Secrets (org-level, inherited by every repo; NETLIFY_SITE_ID is per-repo):
+# Because the ruleset targets ~ALL repos, this workflow SELF-GUARDS: it detects
+# whether the repo is a deployable Astro/Netlify site and no-ops (passes) on
+# tooling repos, so it never blocks a merge on ldco-pulse, MCP servers, etc.
+#
+# Secrets (org-level, visibility=all; NETLIFY_SITE_ID is per-repo):
 #   NETLIFY_AUTH_TOKEN  — org secret (already set)
 #   NETLIFY_SITE_ID     — per-repo secret (set by the provisioning script)
-#   ZULIP_QA_BOT_AUTH   — org secret: the full "Basic <base64>" header value
-#                         for qa-bot@backstage.lockard.co
+#   ZULIP_QA_BOT_AUTH   — org secret: full "Basic <base64>" header for the QA bot
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
 
 concurrency:
-  group: preview-${{ github.event.number }}
+  group: preview-${{ github.repository }}-${{ github.event.number }}
   cancel-in-progress: true
 
 jobs:
@@ -25,19 +26,54 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+
+      - name: Detect deployable site
+        id: detect
+        run: |
+          if ls astro.config.* >/dev/null 2>&1 || [ -f netlify.toml ]; then
+            echo "is_site=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_site=false" >> "$GITHUB_OUTPUT"
+            echo "Not an Astro/Netlify site — preview skipped (passing)."
+          fi
+
+      - name: Setup Node
+        if: steps.detect.outputs.is_site == 'true'
+        uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-      - run: npm ci
+
+      - name: Install
+        if: steps.detect.outputs.is_site == 'true'
+        run: npm ci
 
       - name: Build & deploy preview to Netlify alias
         id: deploy
+        if: steps.detect.outputs.is_site == 'true'
         env:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
           NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+          ZULIP_AUTH: ${{ secrets.ZULIP_QA_BOT_AUTH }}
+          REPO_NAME: ${{ github.event.repository.name }}
           PR_NUMBER: ${{ github.event.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
+          # A site repo with no NETLIFY_SITE_ID is mis-wired: warn loudly into
+          # #qa but PASS (exit 0) so it doesn't hard-block a merge.
+          if [ -z "$NETLIFY_SITE_ID" ]; then
+            echo "::warning::Site repo has no NETLIFY_SITE_ID secret — not wired for preview."
+            if [ -n "$ZULIP_AUTH" ]; then
+              TOPIC="${REPO_NAME}: PR #${PR_NUMBER} ${PR_TITLE}"
+              curl -s -X POST "https://backstage.lockard.co/api/v1/messages" \
+                -H "Authorization: ${ZULIP_AUTH}" \
+                --data-urlencode "type=stream" --data-urlencode "to=qa" \
+                --data-urlencode "topic=${TOPIC}" \
+                --data-urlencode "content=:warning: **No preview** — this repo is missing its \`NETLIFY_SITE_ID\` secret, so it isn't wired for previews. Ping Will to wire it." >/dev/null
+            fi
+            echo "url=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           ALIAS="deploy-preview-${PR_NUMBER}"
           OUT=$(npx netlify deploy --build --alias "$ALIAS" --json)
           URL=$(printf '%s' "$OUT" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s).deploy_url)}catch{console.log("")}})')
@@ -45,25 +81,20 @@ jobs:
           echo "Preview URL: $URL"
 
       - name: Post preview URL into the Zulip #qa topic
-        if: steps.deploy.outputs.url != ''
+        if: steps.detect.outputs.is_site == 'true' && steps.deploy.outputs.url != ''
         env:
-          # Passed via env (never inlined into the script) — PR title is
-          # attacker-controllable, so this avoids shell injection.
           ZULIP_AUTH: ${{ secrets.ZULIP_QA_BOT_AUTH }}
           REPO_NAME: ${{ github.event.repository.name }}
           PR_NUMBER: ${{ github.event.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PREVIEW_URL: ${{ steps.deploy.outputs.url }}
         run: |
-          if [ -z "$ZULIP_AUTH" ]; then
-            echo "ZULIP_QA_BOT_AUTH not set — skipping Zulip post"; exit 0
-          fi
+          if [ -z "$ZULIP_AUTH" ]; then echo "no ZULIP_QA_BOT_AUTH — skip"; exit 0; fi
           TOPIC="${REPO_NAME}: PR #${PR_NUMBER} ${PR_TITLE}"
           CONTENT=":check: **Preview is live for QA:** ${PREVIEW_URL}
           (updates on every push to this branch — same link, new build)"
           curl -s -X POST "https://backstage.lockard.co/api/v1/messages" \
             -H "Authorization: ${ZULIP_AUTH}" \
-            --data-urlencode "type=stream" \
-            --data-urlencode "to=qa" \
+            --data-urlencode "type=stream" --data-urlencode "to=qa" \
             --data-urlencode "topic=${TOPIC}" \
             --data-urlencode "content=${CONTENT}"
